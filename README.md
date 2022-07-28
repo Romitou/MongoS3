@@ -1,7 +1,7 @@
-# Mongo S3
+# Mongo S3 🍃
 A simple utility for backing up MongoDB databases to an S3 server. The utility of backing up a binary archive of your database to an S3 server is the security that your data is not lost through, depending on your server, replication.
 
-## Installation
+## 🚀 Installation
 First of all, this application uses the `mongodump` command, which is part of the `mongodb-database-tools` package. Refer to the documentation of your operating system to install this package.
 
 Secondly, make sure that the process is able to write files, especially in the `temp` folder, relative to where the process is located.
@@ -17,6 +17,6 @@ Third, write the environment file `.env`. Here are the values you need to specif
 
 Then you can run this application periodically (e.g. every day at midnight) to backup your database. This can be done using crontab, depending on your operating system.
 
-## Screenshots
-![](https://github.com/Romitou/MongoS3/raw/main/screenshots/success.png)
-![](https://github.com/Romitou/MongoS3/raw/main/screenshots/error.png)
+## 🖼️ Screenshots
+![](https://github.com/Romitou/MongoS3/raw/main/screenshots/success.jpg)
+![](https://github.com/Romitou/MongoS3/raw/main/screenshots/error.jpg)
