@@ -16,3 +16,7 @@ Third, write the environment file `.env`. Here are the values you need to specif
 * `MONGO_URI` : the MongoDB address ([see documentation](https://www.mongodb.com/docs/manual/reference/connection-string/)) to connect to your cluster
 
 Then you can run this application periodically (e.g. every day at midnight) to backup your database. This can be done using crontab, depending on your operating system.
+
+## Screenshots
+![](https://github.com/Romitou/MongoS3/raw/main/screenshots/success.png)
+![](https://github.com/Romitou/MongoS3/raw/main/screenshots/error.png)
