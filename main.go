@@ -56,7 +56,7 @@ func main() {
 }
 
 func mongoDump() string {
-	output, err := exec.Command("mongodump", "--uri=\""+os.Getenv("MONGO_URI")+"\"", "--archive="+backupPath).CombinedOutput()
+	output, err := exec.Command("mongodump", "-vvv --uri=\""+os.Getenv("MONGO_URI")+"\"", "--archive="+backupPath).CombinedOutput()
 	if err != nil {
 		sendDiscordError(string(output) + "\n\n" + err.Error())
 		log.Fatal(err)
