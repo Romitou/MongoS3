@@ -1,0 +1,4 @@
+.env
+/mongobackup*
+/dist/
+/temp/

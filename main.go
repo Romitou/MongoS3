@@ -1,132 +1,301 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"github.com/joho/godotenv"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"log"
-	"net/http"
-	"net/url"
 	"os"
-	"os/exec"
-	"path"
-	"strconv"
-	"strings"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"filippo.io/age"
+	"github.com/joho/godotenv"
 )
 
-var startTime = time.Now()
-var backupName = "dump." + startTime.Format("2006-01-02T150405") + ".archive"
-var logsName = "dump." + startTime.Format("2006-01-02T150405") + ".logs"
-
-var backupPath = path.Join("temp", backupName)
+// Maximum time given to the failure notification once the backup has failed
+// (the main context may already be cancelled at that point).
+const notifyTimeout = 30 * time.Second
 
 func main() {
-	startTime = time.Now()
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	// The .env file is optional: variables can also come from the real
+	// environment (systemd unit, Docker, CI...).
+	if err := godotenv.Load(); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		log.Fatalf("Error loading .env file: %v", err)
 	}
 
-	minioClient, err := minio.New(os.Getenv("S3_ENDPOINT"), &minio.Options{
-		Creds:  credentials.NewStaticV4(os.Getenv("S3_ID"), os.Getenv("S3_KEY"), ""),
-		Secure: true,
+	start := time.Now()
+	notifier := newDiscordNotifier(os.Getenv("DISCORD_URL"))
+
+	cfg, err := loadConfig(os.Getenv)
+	if cfg.Name == "" {
+		cfg.Name, _ = os.Hostname()
+	}
+	if err != nil {
+		fail(notifier, cfg.Name, nil, &stepError{Step: "Configuration", Err: err}, "")
+	}
+	if !notifier.enabled() {
+		log.Println("DISCORD_URL is not set, Discord notifications are disabled")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	report, dumpLogs, err := run(ctx, cfg, start)
+	if err != nil {
+		stop()
+		fail(notifier, cfg.Name, report.Steps, err, dumpLogs)
+	}
+
+	log.Printf("Backup done in %s (%s)", report.Duration.Round(time.Millisecond), humanSize(report.ArchiveSize))
+	if notifier.enabled() {
+		log.Println("Sending a notification to Discord...")
+		if err := notifier.notifySuccess(ctx, report, time.Now()); err != nil {
+			log.Printf("Warning: %v", err)
+		}
+	}
+}
+
+type step struct {
+	Name     string
+	Duration time.Duration
+}
+
+// stepError tells which step of the backup failed.
+type stepError struct {
+	Step string
+	Err  error
+}
+
+func (e *stepError) Error() string { return e.Step + ": " + e.Err.Error() }
+func (e *stepError) Unwrap() error { return e.Err }
+
+// run performs the backup. The report (with the steps done so far) and the
+// mongodump logs are returned even on failure so they can be reported.
+func run(ctx context.Context, cfg *config, start time.Time) (backupReport, string, error) {
+	report := backupReport{
+		Name:          cfg.Name,
+		RetentionDays: cfg.RetentionDays,
+		LinksExpiry:   cfg.PresignExpiry,
+		Encrypted:     len(cfg.Recipients) > 0,
+		Oplog:         cfg.Oplog,
+	}
+	// timed runs one step of the backup and records its duration.
+	timed := func(name string, fn func() error) error {
+		log.Printf("%s...", name)
+		stepStart := time.Now()
+		err := fn()
+		report.Steps = append(report.Steps, step{Name: name, Duration: time.Since(stepStart)})
+		if err != nil {
+			return &stepError{Step: name, Err: err}
+		}
+		return nil
+	}
+
+	store, err := newStorage(cfg)
+	if err != nil {
+		return report, "", &stepError{Step: "S3 check", Err: err}
+	}
+
+	// Fail fast, before a potentially long dump, if S3 is unreachable.
+	if err := timed("S3 check", func() error { return store.checkBucket(ctx) }); err != nil {
+		return report, "", err
+	}
+
+	base := cfg.S3Prefix + backupObjectPrefix + start.UTC().Format("2006-01-02T150405Z")
+	extension := ".archive"
+	if cfg.Gzip {
+		extension += ".gz"
+	}
+	if report.Encrypted {
+		extension += ".age"
+	}
+	archiveKey := base + extension
+	logsKey := base + ".log"
+
+	var dumpLogs string
+	err = timed("Dump & upload", func() error {
+		var err error
+		dumpLogs, report.ArchiveSize, err = dumpToS3(ctx, cfg, store, archiveKey)
+		return err
 	})
+	report.Stats = parseDumpStats(dumpLogs)
 	if err != nil {
-		log.Fatal(err)
+		return report, dumpLogs, err
+	}
+	log.Printf("Archive %q uploaded", archiveKey)
+
+	// From here on, the backup is safely stored: the remaining steps only
+	// emit warnings instead of failing the whole backup.
+	logsUploaded := timed("Logs upload", func() error {
+		_, err := store.uploadText(ctx, logsKey, dumpLogs)
+		return err
+	}) == nil
+	if !logsUploaded {
+		log.Printf("Warning: logs upload failed")
 	}
 
-	log.Println("Dumping Mongo database...")
-	dumpLogs := mongoDump()
+	if err := timed("Retention", func() error { return applyRetention(ctx, cfg, store, base, extension, start, &report) }); err != nil {
+		log.Printf("Warning: %v", err)
+	}
 
-	log.Println("Sending archive to S3 server...")
-	archiveInfo, logsInfo := sendToS3(minioClient, dumpLogs)
+	_ = timed("Links", func() error {
+		if u, err := store.presign(ctx, archiveKey); err != nil {
+			log.Printf("Warning: %v", err)
+		} else {
+			report.ArchiveURL = u.String()
+		}
+		if logsUploaded {
+			if u, err := store.presign(ctx, logsKey); err != nil {
+				log.Printf("Warning: %v", err)
+			} else {
+				report.LogsURL = u.String()
+			}
+		}
+		return nil
+	})
 
-	log.Println("Cleaning temp archive...")
-	cleanDump()
-
-	log.Println("Retrieving a presigned URL for the backup object from S3 server...")
-	presignedArchive, presignedLogs := getPresignedURL(minioClient, archiveInfo, logsInfo)
-
-	log.Println("Send a notification to Discord...")
-	sendDiscordSuccess(presignedArchive.String(), presignedLogs.String(), archiveInfo)
+	report.Duration = time.Since(start)
+	return report, dumpLogs, nil
 }
 
-func mongoDump() string {
-	output, err := exec.Command("mongodump", "-vvv --uri=\""+os.Getenv("MONGO_URI")+"\"", "--archive="+backupPath).CombinedOutput()
+// dumpToS3 streams mongodump's output, encrypted if needed, to S3 without
+// touching the disk. It returns the mongodump logs and the archive size.
+func dumpToS3(ctx context.Context, cfg *config, store *storage, key string) (string, int64, error) {
+	// Only the mongodump config file (holding the URI) is written to disk.
+	workDir, err := os.MkdirTemp("", "mongos3-")
 	if err != nil {
-		sendDiscordError(string(output) + "\n\n" + err.Error())
-		log.Fatal(err)
+		return "", 0, fmt.Errorf("create temporary directory: %w", err)
 	}
-	return string(output)
+	defer os.RemoveAll(workDir)
+
+	dumpCtx, cancelDump := context.WithCancel(ctx)
+	defer cancelDump()
+
+	type dumpResult struct {
+		logs string
+		err  error
+	}
+	results := make(chan dumpResult, 1)
+	reader, writer := io.Pipe()
+	// Set before the dump error reaches the upload through the pipe.
+	var dumpFailed atomic.Bool
+
+	go func() {
+		var out io.WriteCloser = nopWriteCloser{writer}
+		if len(cfg.Recipients) > 0 {
+			encrypted, err := age.Encrypt(writer, cfg.Recipients...)
+			if err != nil {
+				err = fmt.Errorf("encryption: %w", err)
+				writer.CloseWithError(err)
+				results <- dumpResult{err: err}
+				return
+			}
+			out = encrypted
+		}
+		logs, err := mongoDump(dumpCtx, cfg, workDir, out)
+		if err == nil {
+			// Writes the final encrypted chunk.
+			if err = out.Close(); err != nil {
+				err = fmt.Errorf("encryption: %w", err)
+			}
+		}
+		if err != nil {
+			dumpFailed.Store(true)
+		}
+		// A nil error ends the upload normally; any other aborts it, so a
+		// failed dump is never stored as a truncated archive.
+		writer.CloseWithError(err)
+		results <- dumpResult{logs: logs, err: err}
+	}()
+
+	info, uploadErr := store.uploadStream(ctx, key, reader)
+	// When both fail, report the root cause: either the dump failed and
+	// aborted the upload, or the upload failed and we stop the dump.
+	dumpFailedFirst := dumpFailed.Load()
+	if uploadErr != nil {
+		// Stop mongodump, nobody reads its output anymore.
+		cancelDump()
+		reader.CloseWithError(uploadErr)
+	}
+	result := <-results
+
+	if result.err != nil && (uploadErr == nil || dumpFailedFirst) {
+		return result.logs, 0, result.err
+	}
+	if uploadErr != nil {
+		return result.logs, 0, uploadErr
+	}
+	return result.logs, info.Size, nil
 }
 
-func sendToS3(client *minio.Client, dumpLogs string) (archiveInfo minio.UploadInfo, logsInfo minio.UploadInfo) {
-	archiveInfo, err := client.FPutObject(context.Background(), os.Getenv("S3_BUCKET"), backupName, backupPath, minio.PutObjectOptions{ContentType: "application/octet-stream"})
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+// applyRetention compares the new archive with the previous one and deletes
+// the expired backups, unless the new archive looks suspiciously small.
+func applyRetention(ctx context.Context, cfg *config, store *storage, base, extension string, now time.Time, report *backupReport) error {
+	objects, err := store.listBackups(ctx)
 	if err != nil {
-		marshaledInfo, _ := json.Marshal(archiveInfo)
-		sendDiscordError(string(marshaledInfo) + "\n\n" + err.Error())
-		log.Fatal(err)
+		return err
+	}
+	sets := groupBackups(objects)
+
+	if previous := previousArchive(sets, base, extension); previous != nil {
+		report.PreviousSize = previous.Size
+		drop := sizeDrop(previous.Size, report.ArchiveSize)
+		if cfg.SizeAlertPercent > 0 && drop >= float64(cfg.SizeAlertPercent) {
+			report.SizeAlert = true
+			log.Printf("Warning: the archive is %.0f%% smaller than the previous one (%s)", drop, humanSize(previous.Size))
+		}
 	}
 
-	reader := strings.NewReader(dumpLogs)
-	logsInfo, err = client.PutObject(context.Background(), os.Getenv("S3_BUCKET"), logsName, reader, reader.Size(), minio.PutObjectOptions{ContentType: "text/plain"})
-	if err != nil {
-		log.Println(err)
+	if cfg.RetentionDays <= 0 {
+		return nil
+	}
+	if report.SizeAlert {
+		report.RetentionSkipped = true
+		log.Println("Retention skipped because of the size drop")
+		return nil
 	}
 
-	return
+	cutoff := now.AddDate(0, 0, -cfg.RetentionDays)
+	for _, set := range expiredBackups(sets, cutoff, cfg.KeepMin) {
+		for _, object := range set.Objects {
+			if err := store.remove(ctx, object.Key); err != nil {
+				return err
+			}
+		}
+		report.Pruned++
+		log.Printf("Deleted old backup %q", set.Base)
+	}
+	return nil
 }
 
-func cleanDump() {
-	err := os.Remove(backupPath)
-	if err != nil {
-		sendDiscordError(err.Error())
-		log.Fatal(err)
+// fail reports the error to Discord and exits with a non-zero status.
+func fail(notifier *discordNotifier, name string, steps []step, err error, dumpLogs string) {
+	log.Printf("Backup failed: %v", err)
+
+	failure := failureReport{Name: name, Steps: steps, Details: err.Error()}
+	var se *stepError
+	if errors.As(err, &se) {
+		failure.Step = se.Step
+		failure.Details = se.Err.Error()
 	}
-}
-
-func getPresignedURL(client *minio.Client, archiveInfo minio.UploadInfo, logsInfo minio.UploadInfo) (presignedArchive *url.URL, presignedLogs *url.URL) {
-	presignedArchive, err := client.PresignedGetObject(context.Background(), archiveInfo.Bucket, archiveInfo.Key, time.Hour*7*24, nil)
-	if err != nil {
-		sendDiscordError(err.Error())
-		log.Println(err)
+	if dumpLogs != "" {
+		failure.Details += "\n\n" + dumpLogs
 	}
-
-	presignedLogs, err = client.PresignedGetObject(context.Background(), logsInfo.Bucket, logsInfo.Key, time.Hour*7*24, nil)
-	if err != nil {
-		log.Println(err)
+	if notifier.enabled() {
+		ctx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+		defer cancel()
+		if notifyErr := notifier.notifyFailure(ctx, failure, time.Now()); notifyErr != nil {
+			log.Printf("Warning: %v", notifyErr)
+		}
 	}
-
-	return
-}
-
-func sendDiscordSuccess(presignedArchive string, presignedLogs string, archiveInfo minio.UploadInfo) {
-	sendDiscordMessage("{\"content\":null,\"embeds\":[{\"title\":\"New MongoDB backup\",\"description\":\"A new backup of the database has been performed today, at " + time.Now().Format("15:04:05") + ". This backup has been sent to the S3 backup server.\",\"color\":5832563,\"fields\":[{\"name\":\"\\u231b Execution time\",\"value\":\"" + strconv.Itoa(int(time.Now().Unix()-startTime.Unix())) + "ms\",\"inline\":true},{\"name\":\"\\u2705 Retention period\",\"value\":\"" + os.Getenv("S3_RETENTION") + " days\",\"inline\":true},{\"name\":\"\\ud83d\\udcc4 Backup size\",\"value\":\"" + strconv.Itoa(int(archiveInfo.Size)/(1<<10)) + " KB\",\"inline\":true},{\"name\":\"\\ud83d\\udcdc Backup logs\",\"value\":\"[Click to open the generated logs](" + presignedLogs + ")\",\"inline\":true},{\"name\":\"\\ud83d\\udce5 Download link\",\"value\":\"[Click to download the backup archive](" + presignedArchive + ")\",\"inline\":true}]}],\"attachments\":[]}")
-}
-
-func sendDiscordError(info string) {
-
-	jsonInfo := jsonEncode(info)
-
-	sendDiscordMessage("{\"content\":null,\"embeds\":[{\"title\":\"Failed MongoDB backup\",\"description\":\"A backup attempt of the MongoDB database has been performed today at " + time.Now().Format("15:04:05") + ". An error was encountered during the backup process, you can find all the information below.\",\"color\":16734296,\"fields\":[{\"name\":\"\\ud83d\\udd0e Backup error\",\"value\":\"```" + string(jsonInfo) + "```\"}]}],\"attachments\":[]}")
-}
-
-func sendDiscordMessage(json string) {
-	_, err := http.Post(os.Getenv("DISCORD_URL"), "application/json", bytes.NewBufferString(json))
-	if err != nil {
-		log.Println(err)
-		return
-	}
-}
-
-func jsonEncode(jsonString string) string {
-	b, err := json.Marshal(jsonString)
-	if err != nil {
-		return ""
-	}
-	return string(b[1 : len(b)-1])
+	os.Exit(1)
 }
